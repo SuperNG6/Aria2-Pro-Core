@@ -71,6 +71,9 @@ jobs:
       run: |
         ./output/aria2c https://raw.githubusercontent.com/P3TERX/aria2.conf/master/dht.dat
         ./output/aria2c https://raw.githubusercontent.com/P3TERX/aria2.conf/master/dht6.dat
+        ARCH_TORRENT=$(curl -sSL "https://geo.mirror.pkgbuild.com/iso/latest/" | \
+          grep -oE 'archlinux-[0-9]{4}\.[0-9]{2}\.[0-9]{2}-x86_64\.iso\.torrent' | head -1)
+        [ -n "$ARCH_TORRENT" ] || { echo "Failed to resolve Arch Linux torrent filename"; exit 1; }
         ./output/aria2c \
           --seed-time=0 \
           --enable-dht6=true \
@@ -78,7 +81,7 @@ jobs:
           --dht-file-path6="$PWD/dht6.dat" \
           --dht-entry-point='dht.transmissionbt.com:6881' \
           --dht-entry-point6='dht.transmissionbt.com:6881' \
-          "https://geo.mirror.pkgbuild.com/iso/latest/archlinux-2026.01.01-x86_64.iso.torrent"
+          "https://geo.mirror.pkgbuild.com/iso/latest/${ARCH_TORRENT}"
 
     - name: Generate release informations
       run: |
