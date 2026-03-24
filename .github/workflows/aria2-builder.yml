@@ -85,7 +85,7 @@ jobs:
 
     - name: Generate release informations
       run: |
-        TIME="$(curl https://api.github.com/repos/antman666/Aria2-Pro-Core/actions/runs/${GITHUB_RUN_ID} | jq -r .created_at)"
+        TIME="$(curl https://api.github.com/repos/${SCRIPT_REPO}/actions/runs/${GITHUB_RUN_ID} | jq -r .created_at)"
         TAG="ci-$(date -d "${TIME}" -u +'%Y%m%d-%H%M%S-%Z')"
         VER="1.37.0"
         echo "RELEASE=${VER}_${TIME}" >> $GITHUB_ENV
