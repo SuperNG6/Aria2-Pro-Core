@@ -83,11 +83,52 @@ jobs:
           --dht-entry-point6='dht.transmissionbt.com:6881' \
           "https://geo.mirror.pkgbuild.com/iso/latest/${ARCH_TORRENT}"
 
+    - name: RPC Version Testing
+      if: matrix.PLATFORMS == 'amd64'
+      run: |
+        CLI_VER="$(./output/aria2c --version | head -1 | awk '{print $3}')"
+        echo "CLI version: ${CLI_VER}"
+        [ -n "${CLI_VER}" ] || { echo "Failed to parse CLI version"; exit 1; }
+
+        RPC_SECRET="ci-test-$(date +%s)"
+        ./output/aria2c \
+          --enable-rpc \
+          --rpc-listen-all=false \
+          --rpc-listen-port=6800 \
+          --rpc-secret="${RPC_SECRET}" \
+          --daemon=true \
+          --dir=/tmp
+
+        for i in 1 2 3 4 5; do
+          curl -fsS http://127.0.0.1:6800/jsonrpc \
+            -H 'Content-Type: application/json' \
+            -d "{\"jsonrpc\":\"2.0\",\"id\":\"ping\",\"method\":\"aria2.getVersion\",\"params\":[\"token:${RPC_SECRET}\"]}" \
+            >/dev/null && break
+          sleep 1
+        done
+
+        RESP=$(curl -fsS http://127.0.0.1:6800/jsonrpc \
+          -H 'Content-Type: application/json' \
+          -d "{\"jsonrpc\":\"2.0\",\"id\":\"v\",\"method\":\"aria2.getVersion\",\"params\":[\"token:${RPC_SECRET}\"]}")
+        echo "RPC response: ${RESP}"
+        RPC_VER=$(echo "${RESP}" | jq -r '.result.version')
+
+        curl -fsS http://127.0.0.1:6800/jsonrpc \
+          -H 'Content-Type: application/json' \
+          -d "{\"jsonrpc\":\"2.0\",\"id\":\"s\",\"method\":\"aria2.shutdown\",\"params\":[\"token:${RPC_SECRET}\"]}" \
+          >/dev/null || true
+
+        if [ "${RPC_VER}" != "${CLI_VER}" ]; then
+          echo "::error::RPC version (${RPC_VER}) does not match CLI version (${CLI_VER})"
+          exit 1
+        fi
+        echo "ARIA2_VERSION=${CLI_VER}" >> $GITHUB_ENV
+
     - name: Generate release informations
       run: |
         TIME="$(curl https://api.github.com/repos/${SCRIPT_REPO}/actions/runs/${GITHUB_RUN_ID} | jq -r .created_at)"
         TAG="ci-$(date -d "${TIME}" -u +'%Y%m%d-%H%M%S-%Z')"
-        VER="1.37.0"
+        VER="${ARIA2_VERSION:-$(./output/aria2c --version | head -1 | awk '{print $3}')}"
         echo "RELEASE=${VER}_${TIME}" >> $GITHUB_ENV
         cat <<EOF | sed -E 's/^  //' | tee Release.md
           Aria2 ${VER} build with openssl 3.5
