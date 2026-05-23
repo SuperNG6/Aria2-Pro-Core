@@ -1,33 +1,79 @@
-From b09c27a89514d8f10d06ae25dbdd4409442613f3 Mon Sep 17 00:00:00 2001
+From 7f52ec28f48df28afe4dc2acee9f1de3b5e3fe14 Mon Sep 17 00:00:00 2001
 From: Aria2-Pro-Core <builder@local>
-Date: Sat, 23 May 2026 12:45:27 +0800
-Subject: [PATCH] rpc: add removeFiles flag to
- remove/forceRemove/removeDownloadResult
+Date: Sat, 23 May 2026 13:52:44 +0800
+Subject: [PATCH] rpc: add removeFiles flag plus rpc-remove-files-default
+ option
 
-Adds an optional boolean parameter to aria2.remove, aria2.forceRemove,
-and aria2.removeDownloadResult. When true, the downloaded files (data
-and per-task control file) are deleted along with the task/result.
-Omitted or false keeps upstream behavior, so existing clients are
-unaffected.
+Adds an optional boolean parameter (index 1) to aria2.remove,
+aria2.forceRemove and aria2.removeDownloadResult. When true, downloaded
+files and their .aria2 control file are deleted along with the task or
+result. When omitted, the new --rpc-remove-files-default option decides
+(default false, matching upstream behavior). Explicit removeFiles=false
+always keeps files, so existing clients are unaffected.
 
-For active groups the flag is recorded in RequestGroupMan and consumed
-in ProcessStoppedRequestGroup after the I/O loop releases the file
-handles; for reserved (paused/queued) groups the deletion is
-synchronous; for already-stopped results it is handled directly in
-removeDownloadResult. The control file is removed via the group's
-BtProgressInfoFile, which uses the correct BT (<basePath>/<name>.aria2)
-or HTTP (<file>.aria2) path.
+Active groups: the RPC handler stores the GID in RequestGroupMan and
+the mark is consumed in ProcessStoppedRequestGroup after the I/O loop
+releases file handles. When the mark is taken, the stop processing
+skips saveControlFile and post-download handlers (no signature save,
+no nextGroups insertion) and skips addDownloadResult so the task does
+not bump numStoppedTotal_ or evict unrelated entries in
+max-download-result. An explicit remove with file deletion overrides a
+prior pause request.
+
+Reserved/paused groups: the handler synchronously deletes files
+before removeReservedGroup.
+
+Stopped results: removeDownloadResult(gid, true) unlinks the per-entry
+data file and a best-effort .aria2 control file.
+
+Control file removal goes through group->removeControlFile() which
+uses BtProgressInfoFile, so both the HTTP (<file>.aria2) and BT
+(<basePath>/<name>.aria2) cases are handled. For multi-file torrents
+the cleanup walks every file's ancestor chain up to the base path and
+rmdir's deepest-first, leaving an empty top-level dir to be removed at
+the end.
 ---
- src/RequestGroupMan.cc | 111 ++++++++++++++++++++++++++++++++++++++++-
- src/RequestGroupMan.h  |  29 +++++++++--
- src/RpcMethodImpl.cc   |  17 ++++++-
- 3 files changed, 152 insertions(+), 5 deletions(-)
+ src/OptionHandlerFactory.cc |   7 ++
+ src/RequestGroupMan.cc      | 159 +++++++++++++++++++++++++++++++++++-
+ src/RequestGroupMan.h       |  29 ++++++-
+ src/RpcMethodImpl.cc        |  25 +++++-
+ src/prefs.cc                |   3 +
+ src/prefs.h                 |   2 +
+ src/usage_text.h            |   7 ++
+ 7 files changed, 224 insertions(+), 8 deletions(-)
 
+diff --git a/src/OptionHandlerFactory.cc b/src/OptionHandlerFactory.cc
+index 000426b..892f384 100644
+--- a/src/OptionHandlerFactory.cc
++++ b/src/OptionHandlerFactory.cc
+@@ -764,6 +764,13 @@ std::vector<OptionHandler*> OptionHandlerFactory::createOptionHandlers()
+     op->addTag(TAG_RPC);
+     handlers.push_back(op);
+   }
++  {
++    OptionHandler* op(new BooleanOptionHandler(
++        PREF_RPC_REMOVE_FILES_DEFAULT, TEXT_RPC_REMOVE_FILES_DEFAULT,
++        A2_V_FALSE, OptionHandler::OPT_ARG));
++    op->addTag(TAG_RPC);
++    handlers.push_back(op);
++  }
+   {
+     OptionHandler* op(new NumberOptionHandler(
+         PREF_RPC_LISTEN_PORT, TEXT_RPC_LISTEN_PORT, "6800", 1024, UINT16_MAX));
 diff --git a/src/RequestGroupMan.cc b/src/RequestGroupMan.cc
-index 425351b..0c7a54d 100644
+index 425351b..7c3c342 100644
 --- a/src/RequestGroupMan.cc
 +++ b/src/RequestGroupMan.cc
-@@ -237,6 +237,72 @@ bool RequestGroupMan::removeReservedGroup(a2_gid_t gid)
+@@ -40,6 +40,8 @@
+ #include <sstream>
+ #include <numeric>
+ #include <algorithm>
++#include <functional>
++#include <set>
+ #include <utility>
+ 
+ #include "BtProgressInfoFile.h"
+@@ -237,6 +239,91 @@ bool RequestGroupMan::removeReservedGroup(a2_gid_t gid)
    return reservedGroups_.remove(gid);
  }
  
@@ -65,6 +111,10 @@ index 425351b..0c7a54d 100644
 +  catch (RecoverableException&) {
 +    // ignore
 +  }
++  // Track parent directories of every removed file so we can clean up
++  // empty subdirs left behind by multi-file torrents.
++  std::set<std::string, std::greater<std::string>> dirsToReap;
++  const std::string& basePath = dctx->getBasePath();
 +  for (const auto& entry : dctx->getFileEntries()) {
 +    if (!entry) {
 +      continue;
@@ -82,13 +132,28 @@ index 425351b..0c7a54d 100644
 +        A2_LOG_INFO(fmt(MSG_FILE_COULD_NOT_REMOVED, path.c_str()));
 +      }
 +    }
++    // Record every ancestor directory strictly between the file and the
++    // base path. std::greater<> sorts deepest-first by lexicographic
++    // length-then-name, so child dirs are rmdir'd before their parents.
++    auto slash = path.find_last_of('/');
++    while (slash != std::string::npos) {
++      std::string parent = path.substr(0, slash);
++      if (parent.size() <= basePath.size() || parent == basePath) {
++        break;
++      }
++      dirsToReap.insert(parent);
++      slash = parent.find_last_of('/');
++    }
 +  }
-+  // Best-effort: also try to clear the BT top-level directory. File::remove()
-+  // only succeeds when the directory is empty, so this is safe for the
-+  // single-file HTTP case (basePath equals the file path, already removed)
-+  // and only acts on multi-file torrents where every selected file has just
-+  // been deleted above.
-+  const std::string& basePath = dctx->getBasePath();
++  for (const auto& d : dirsToReap) {
++    File dir(d);
++    if (dir.exists() && dir.isDir()) {
++      dir.remove(); // best-effort, only succeeds when empty
++    }
++  }
++  // Finally try the torrent top-level dir. For the single-file HTTP case
++  // basePath equals the data file (already removed above) so this is a
++  // no-op; for BT torrents it removes the now-empty top-level directory.
 +  if (!basePath.empty()) {
 +    File base(basePath);
 +    if (base.exists() && base.isDir()) {
@@ -100,27 +165,80 @@ index 425351b..0c7a54d 100644
  namespace {
  
  void notifyDownloadEvent(DownloadEvent event,
-@@ -455,7 +521,19 @@ public:
+@@ -354,6 +441,18 @@ public:
+       const std::shared_ptr<DownloadContext>& dctx =
+           group->getDownloadContext();
+ 
++      // Pull the removeFiles mark up front so every downstream decision
++      // (save vs. delete control file, post-download processing,
++      // addDownloadResult vs. skip) can take it into account in one place.
++      bool removeFilesRequested =
++          e_->getRequestGroupMan()->takeRemoveFilesMark(group->getGID());
++      // An explicit remove(gid, true) overrides a prior pause: if the user
++      // first paused then asked to remove with files, the remove intent
++      // wins — otherwise the mark would be silently dropped when the group
++      // gets pushed back onto reservedGroups_ by the pause path.
++      bool isPause =
++          group->isPauseRequested() && !removeFilesRequested;
++
+       if (!group->isSeedOnlyEnabled()) {
+         e_->getRequestGroupMan()->decreaseNumActive();
+       }
+@@ -369,13 +468,25 @@ public:
+       }
+       try {
+         group->closeFile();
+-        if (group->isPauseRequested()) {
++        if (isPause) {
+           if (!group->isRestartRequested()) {
+             A2_LOG_NOTICE(fmt(_("Download GID#%s paused"),
+                               GroupId::toHex(group->getGID()).c_str()));
+           }
+           group->saveControlFile();
+         }
++        else if (removeFilesRequested) {
++          // Skip both saveControlFile() and post-download processing: we
++          // are about to delete every artifact of this group. Saving the
++          // control file here would only force an immediate unlink in
++          // removeFilesForGroup() below; running post-download handlers
++          // (signature save, metalink extraction, nextGroups insertion)
++          // for a task the user just told us to discard is wasted work
++          // with potentially confusing side effects.
++          A2_LOG_NOTICE(
++              fmt(_("Download GID#%s removed with file deletion"),
++                  GroupId::toHex(group->getGID()).c_str()));
++        }
+         else if (group->downloadFinished() &&
+                  !group->getDownloadContext()->isChecksumVerificationNeeded()) {
+           group->applyLastModifiedTimeToLocalFiles();
+@@ -431,7 +542,7 @@ public:
+       catch (RecoverableException& ex) {
+         A2_LOG_ERROR_EX(EX_EXCEPTION_CAUGHT, ex);
+       }
+-      if (group->isPauseRequested()) {
++      if (isPause) {
+         group->setState(RequestGroup::STATE_WAITING);
+         reservedGroups_.push_front(group->getGID(), group);
+         group->releaseRuntimeResource(e_);
+@@ -455,7 +566,16 @@ public:
        }
        else {
          std::shared_ptr<DownloadResult> dr = group->createDownloadResult();
-+        bool removeFilesRequested =
-+            e_->getRequestGroupMan()->takeRemoveFilesMark(group->getGID());
+-        e_->getRequestGroupMan()->addDownloadResult(dr);
 +        if (removeFilesRequested) {
 +          e_->getRequestGroupMan()->removeFilesForGroup(group);
++          // Skip addDownloadResult entirely so the task does not appear
++          // in tellStopped, does not bump numStoppedTotal_, and does not
++          // cause max-download-result eviction of unrelated older
++          // entries. The user asked for the task to disappear.
 +        }
-         e_->getRequestGroupMan()->addDownloadResult(dr);
-+        if (removeFilesRequested) {
-+          // Discard the history entry too: the user asked for the task and
-+          // its files to disappear entirely. addDownloadResult above already
-+          // bumped numStoppedTotal_ and triggered eviction, which is correct.
-+          e_->getRequestGroupMan()->removeDownloadResult(
-+              dr->gid->getNumericId(), false);
++        else {
++          e_->getRequestGroupMan()->addDownloadResult(dr);
 +        }
          executeStopHook(group, e_->getOption(), dr->result);
          group->releaseRuntimeResource(e_);
        }
-@@ -909,8 +987,39 @@ RequestGroupMan::findDownloadResult(a2_gid_t gid) const
+@@ -909,8 +1029,39 @@ RequestGroupMan::findDownloadResult(a2_gid_t gid) const
    return downloadResults_.get(gid);
  }
  
@@ -223,15 +341,21 @@ index b8aa8d4..924c73d 100644
    void addDownloadResult(const std::shared_ptr<DownloadResult>& downloadResult);
  
 diff --git a/src/RpcMethodImpl.cc b/src/RpcMethodImpl.cc
-index c224920..bd2af3c 100644
+index c224920..eb73e76 100644
 --- a/src/RpcMethodImpl.cc
 +++ b/src/RpcMethodImpl.cc
-@@ -390,11 +390,19 @@ std::unique_ptr<ValueBase> removeDownload(const RpcRequest& req,
+@@ -390,11 +390,25 @@ std::unique_ptr<ValueBase> removeDownload(const RpcRequest& req,
                                            DownloadEngine* e, bool forceRemove)
  {
    const String* gidParam = checkRequiredParam<String>(req, 0);
 +  const Bool* removeFilesParam = checkParam<Bool>(req, 1);
-+  bool removeFiles = removeFilesParam && removeFilesParam->val();
++  // Explicit param wins; otherwise fall back to the daemon default.
++  // The default is governed by --rpc-remove-files-default (default: false,
++  // matching upstream). Operators who want WebUIs that only have a single
++  // "delete" button to also delete files can flip the option to true.
++  bool removeFiles = removeFilesParam
++      ? removeFilesParam->val()
++      : e->getOption()->getAsBool(PREF_RPC_REMOVE_FILES_DEFAULT);
  
    a2_gid_t gid = str2Gid(gidParam);
    auto group = e->getRequestGroupMan()->findGroup(gid);
@@ -246,7 +370,7 @@ index c224920..bd2af3c 100644
        if (forceRemove) {
          group->setForceHaltRequested(true, RequestGroup::USER_REQUEST);
        }
-@@ -405,6 +413,11 @@ std::unique_ptr<ValueBase> removeDownload(const RpcRequest& req,
+@@ -405,6 +419,11 @@ std::unique_ptr<ValueBase> removeDownload(const RpcRequest& req,
      }
      else {
        if (group->isDependencyResolved()) {
@@ -258,12 +382,14 @@ index c224920..bd2af3c 100644
          e->getRequestGroupMan()->removeReservedGroup(gid);
        }
        else {
-@@ -1097,9 +1110,11 @@ std::unique_ptr<ValueBase>
+@@ -1097,9 +1116,13 @@ std::unique_ptr<ValueBase>
  RemoveDownloadResultRpcMethod::process(const RpcRequest& req, DownloadEngine* e)
  {
    const String* gidParam = checkRequiredParam<String>(req, 0);
 +  const Bool* removeFilesParam = checkParam<Bool>(req, 1);
-+  bool removeFiles = removeFilesParam && removeFilesParam->val();
++  bool removeFiles = removeFilesParam
++      ? removeFilesParam->val()
++      : e->getOption()->getAsBool(PREF_RPC_REMOVE_FILES_DEFAULT);
  
    a2_gid_t gid = str2Gid(gidParam);
 -  if (!e->getRequestGroupMan()->removeDownloadResult(gid)) {
@@ -271,6 +397,51 @@ index c224920..bd2af3c 100644
      throw DL_ABORT_EX(fmt("Could not remove download result of GID#%s",
                            GroupId::toHex(gid).c_str()));
    }
+diff --git a/src/prefs.cc b/src/prefs.cc
+index 2591b9f..f83798e 100644
+--- a/src/prefs.cc
++++ b/src/prefs.cc
+@@ -278,6 +278,9 @@ PrefPtr PREF_RPC_MAX_REQUEST_SIZE = makePref("rpc-max-request-size");
+ PrefPtr PREF_RPC_LISTEN_ALL = makePref("rpc-listen-all");
+ // value: true | false
+ PrefPtr PREF_RPC_ALLOW_ORIGIN_ALL = makePref("rpc-allow-origin-all");
++// value: true | false
++PrefPtr PREF_RPC_REMOVE_FILES_DEFAULT =
++    makePref("rpc-remove-files-default");
+ // value: string that your file system recognizes as a file name.
+ PrefPtr PREF_RPC_CERTIFICATE = makePref("rpc-certificate");
+ // value: string that your file system recognizes as a file name.
+diff --git a/src/prefs.h b/src/prefs.h
+index 338fd6e..8f3057c 100644
+--- a/src/prefs.h
++++ b/src/prefs.h
+@@ -231,6 +231,8 @@ extern PrefPtr PREF_RPC_MAX_REQUEST_SIZE;
+ extern PrefPtr PREF_RPC_LISTEN_ALL;
+ // value: true | false
+ extern PrefPtr PREF_RPC_ALLOW_ORIGIN_ALL;
++// value: true | false
++extern PrefPtr PREF_RPC_REMOVE_FILES_DEFAULT;
+ // value: string that your file system recognizes as a file name.
+ extern PrefPtr PREF_RPC_CERTIFICATE;
+ // value: string that your file system recognizes as a file name.
+diff --git a/src/usage_text.h b/src/usage_text.h
+index 0871543..7dd5198 100644
+--- a/src/usage_text.h
++++ b/src/usage_text.h
+@@ -841,6 +841,13 @@
+   _(" --rpc-listen-all[=true|false] Listen incoming JSON-RPC/XML-RPC requests on all\n" \
+     "                              network interfaces. If false is given, listen only\n" \
+     "                              on local loopback interface.")
++#define TEXT_RPC_REMOVE_FILES_DEFAULT                                       \
++  _(" --rpc-remove-files-default[=true|false] When true, aria2.remove,\n" \
++    "                              aria2.forceRemove and aria2.removeDownloadResult\n" \
++    "                              delete the downloaded file(s) along with the task\n" \
++    "                              when the optional removeFiles parameter is not\n" \
++    "                              given. Clients that explicitly pass removeFiles\n" \
++    "                              still win. Default: false (upstream behavior).")
+ #define TEXT_RPC_LISTEN_PORT                                        \
+   _(" --rpc-listen-port=PORT       Specify a port number for JSON-RPC/XML-RPC server\n" \
+     "                              to listen to.")
 -- 
 2.50.1 (Apple Git-155)
 

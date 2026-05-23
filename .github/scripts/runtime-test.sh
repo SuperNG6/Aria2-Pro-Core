@@ -299,8 +299,31 @@ t_remove_files_active() {
         ng "数据文件仍存在"
         docker exec "$CONTAINER" ls -la "/downloads/$fname"* 2>&1 | head -3 || true
     fi
-    rpc aria2.removeDownloadResult "[\"$gid\"]" >/dev/null 2>&1 || true
+    # 验证 fix #3：history 里不应该出现这个 GID（addDownloadResult 被跳过）
+    # 注意：rpc() 用 curl -fsS，HTTP 400 会让管道整体 exit 22；配合 pipefail
+    # 后 if 判定会"非 0"。先把 RPC 结果落地再判，避免假阳性。
+    local status_resp
+    status_resp=$(rpc aria2.tellStatus "[\"$gid\"]" 2>/dev/null || true)
+    if echo "$status_resp" | jq -e '.result' >/dev/null 2>&1; then
+        ng "history 仍有该 GID 条目（fix #3 未生效）"
+    else
+        ok "tellStatus 不返回 result → history 未保留（fix #3：跳过 addDownloadResult）"
+    fi
     rpc aria2.changeGlobalOption '[{"max-overall-download-limit":"0"}]' >/dev/null
+}
+
+t_option_wiring() {
+    hdr "11. --rpc-remove-files-default 选项已编入二进制"
+    if [[ -z "$CONTAINER" ]]; then echo "  ⚠ 跳过：未提供容器名"; return; fi
+    # 不用 grep -q：管道前段还在写时 grep 早退会触发 SIGPIPE，
+    # 配合 pipefail 让整管道返回 141，被 if 误判为失败。
+    local help_text
+    help_text=$(docker exec "$CONTAINER" aria2c --help=rpc 2>&1 || true)
+    if echo "$help_text" | grep -q -- "--rpc-remove-files-default"; then
+        ok "aria2c --help=rpc 列出 --rpc-remove-files-default"
+    else
+        ng "选项未在 help 中出现（OptionHandlerFactory 未注册或 prefs 未导出）"
+    fi
 }
 
 # ─────────────────── main ───────────────────
@@ -321,6 +344,7 @@ t_remove_files_completed_result
 t_remove_files_backward_compat
 t_remove_files_paused
 t_remove_files_active
+t_option_wiring
 
 echo
 echo "═════════════════════════════════"
