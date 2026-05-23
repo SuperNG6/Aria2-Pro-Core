@@ -1,49 +1,35 @@
-From 7f52ec28f48df28afe4dc2acee9f1de3b5e3fe14 Mon Sep 17 00:00:00 2001
+From 186dfa1b40569b7d7bfe1661715820280b35ea37 Mon Sep 17 00:00:00 2001
 From: Aria2-Pro-Core <builder@local>
-Date: Sat, 23 May 2026 13:52:44 +0800
+Date: Sat, 23 May 2026 15:06:03 +0800
 Subject: [PATCH] rpc: add removeFiles flag plus rpc-remove-files-default
  option
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
 
-Adds an optional boolean parameter (index 1) to aria2.remove,
+Adds optional boolean parameter (index 1) to aria2.remove,
 aria2.forceRemove and aria2.removeDownloadResult. When true, downloaded
 files and their .aria2 control file are deleted along with the task or
 result. When omitted, the new --rpc-remove-files-default option decides
 (default false, matching upstream behavior). Explicit removeFiles=false
 always keeps files, so existing clients are unaffected.
 
-Active groups: the RPC handler stores the GID in RequestGroupMan and
-the mark is consumed in ProcessStoppedRequestGroup after the I/O loop
-releases file handles. When the mark is taken, the stop processing
-skips saveControlFile and post-download handlers (no signature save,
-no nextGroups insertion) and skips addDownloadResult so the task does
-not bump numStoppedTotal_ or evict unrelated entries in
-max-download-result. An explicit remove with file deletion overrides a
-prior pause request.
-
-Reserved/paused groups: the handler synchronously deletes files
-before removeReservedGroup.
-
-Stopped results: removeDownloadResult(gid, true) unlinks the per-entry
-data file and a best-effort .aria2 control file.
-
-Control file removal goes through group->removeControlFile() which
-uses BtProgressInfoFile, so both the HTTP (<file>.aria2) and BT
-(<basePath>/<name>.aria2) cases are handled. For multi-file torrents
-the cleanup walks every file's ancestor chain up to the base path and
-rmdir's deepest-first, leaving an empty top-level dir to be removed at
-the end.
+For trailing optional parameters a local checkOptionalParam<T> helper
+treats a wrong-type slot as 'not present' instead of throwing — upstream
+RPC silently ignores unknown trailing params, and clients that send
+extras of unexpected types for slot 1 must keep working.
 ---
  src/OptionHandlerFactory.cc |   7 ++
  src/RequestGroupMan.cc      | 159 +++++++++++++++++++++++++++++++++++-
  src/RequestGroupMan.h       |  29 ++++++-
- src/RpcMethodImpl.cc        |  25 +++++-
+ src/RpcMethodImpl.cc        |  42 +++++++++-
  src/prefs.cc                |   3 +
  src/prefs.h                 |   2 +
  src/usage_text.h            |   7 ++
- 7 files changed, 224 insertions(+), 8 deletions(-)
+ 7 files changed, 241 insertions(+), 8 deletions(-)
 
 diff --git a/src/OptionHandlerFactory.cc b/src/OptionHandlerFactory.cc
-index 000426b..892f384 100644
+index 000426b6..892f3845 100644
 --- a/src/OptionHandlerFactory.cc
 +++ b/src/OptionHandlerFactory.cc
 @@ -764,6 +764,13 @@ std::vector<OptionHandler*> OptionHandlerFactory::createOptionHandlers()
@@ -61,7 +47,7 @@ index 000426b..892f384 100644
      OptionHandler* op(new NumberOptionHandler(
          PREF_RPC_LISTEN_PORT, TEXT_RPC_LISTEN_PORT, "6800", 1024, UINT16_MAX));
 diff --git a/src/RequestGroupMan.cc b/src/RequestGroupMan.cc
-index 425351b..7c3c342 100644
+index 425351bb..7c3c342d 100644
 --- a/src/RequestGroupMan.cc
 +++ b/src/RequestGroupMan.cc
 @@ -40,6 +40,8 @@
@@ -280,7 +266,7 @@ index 425351b..7c3c342 100644
  }
  
 diff --git a/src/RequestGroupMan.h b/src/RequestGroupMan.h
-index b8aa8d4..924c73d 100644
+index b8aa8d4f..924c73dd 100644
 --- a/src/RequestGroupMan.h
 +++ b/src/RequestGroupMan.h
 @@ -42,6 +42,7 @@
@@ -341,14 +327,36 @@ index b8aa8d4..924c73d 100644
    void addDownloadResult(const std::shared_ptr<DownloadResult>& downloadResult);
  
 diff --git a/src/RpcMethodImpl.cc b/src/RpcMethodImpl.cc
-index c224920..eb73e76 100644
+index c2249202..092cf257 100644
 --- a/src/RpcMethodImpl.cc
 +++ b/src/RpcMethodImpl.cc
-@@ -390,11 +390,25 @@ std::unique_ptr<ValueBase> removeDownload(const RpcRequest& req,
+@@ -385,16 +385,47 @@ std::unique_ptr<ValueBase> AddMetalinkRpcMethod::process(const RpcRequest& req,
+ }
+ #endif // ENABLE_METALINK
+ 
++namespace {
++// Like checkParam<T> but treats a wrong-type parameter as "not present"
++// instead of throwing. Used for trailing optional parameters where the
++// strict mode would regress backward compatibility — upstream aria2 RPC
++// silently ignores unknown trailing parameters, and clients that happen
++// to send extras (Dicts, Strings, etc. for slots we did not previously
++// inspect) should keep working.
++template <typename T>
++const T* checkOptionalParam(const RpcRequest& req, size_t index)
++{
++  if (req.params->size() <= index) {
++    return nullptr;
++  }
++  return downcast<T>(req.params->get(index));
++}
++} // namespace
++
+ namespace {
+ std::unique_ptr<ValueBase> removeDownload(const RpcRequest& req,
                                            DownloadEngine* e, bool forceRemove)
  {
    const String* gidParam = checkRequiredParam<String>(req, 0);
-+  const Bool* removeFilesParam = checkParam<Bool>(req, 1);
++  const Bool* removeFilesParam = checkOptionalParam<Bool>(req, 1);
 +  // Explicit param wins; otherwise fall back to the daemon default.
 +  // The default is governed by --rpc-remove-files-default (default: false,
 +  // matching upstream). Operators who want WebUIs that only have a single
@@ -370,7 +378,7 @@ index c224920..eb73e76 100644
        if (forceRemove) {
          group->setForceHaltRequested(true, RequestGroup::USER_REQUEST);
        }
-@@ -405,6 +419,11 @@ std::unique_ptr<ValueBase> removeDownload(const RpcRequest& req,
+@@ -405,6 +436,11 @@ std::unique_ptr<ValueBase> removeDownload(const RpcRequest& req,
      }
      else {
        if (group->isDependencyResolved()) {
@@ -382,11 +390,11 @@ index c224920..eb73e76 100644
          e->getRequestGroupMan()->removeReservedGroup(gid);
        }
        else {
-@@ -1097,9 +1116,13 @@ std::unique_ptr<ValueBase>
+@@ -1097,9 +1133,13 @@ std::unique_ptr<ValueBase>
  RemoveDownloadResultRpcMethod::process(const RpcRequest& req, DownloadEngine* e)
  {
    const String* gidParam = checkRequiredParam<String>(req, 0);
-+  const Bool* removeFilesParam = checkParam<Bool>(req, 1);
++  const Bool* removeFilesParam = checkOptionalParam<Bool>(req, 1);
 +  bool removeFiles = removeFilesParam
 +      ? removeFilesParam->val()
 +      : e->getOption()->getAsBool(PREF_RPC_REMOVE_FILES_DEFAULT);
@@ -398,7 +406,7 @@ index c224920..eb73e76 100644
                            GroupId::toHex(gid).c_str()));
    }
 diff --git a/src/prefs.cc b/src/prefs.cc
-index 2591b9f..f83798e 100644
+index 2591b9f0..f83798e4 100644
 --- a/src/prefs.cc
 +++ b/src/prefs.cc
 @@ -278,6 +278,9 @@ PrefPtr PREF_RPC_MAX_REQUEST_SIZE = makePref("rpc-max-request-size");
@@ -412,7 +420,7 @@ index 2591b9f..f83798e 100644
  PrefPtr PREF_RPC_CERTIFICATE = makePref("rpc-certificate");
  // value: string that your file system recognizes as a file name.
 diff --git a/src/prefs.h b/src/prefs.h
-index 338fd6e..8f3057c 100644
+index 338fd6e6..8f3057c0 100644
 --- a/src/prefs.h
 +++ b/src/prefs.h
 @@ -231,6 +231,8 @@ extern PrefPtr PREF_RPC_MAX_REQUEST_SIZE;
@@ -425,7 +433,7 @@ index 338fd6e..8f3057c 100644
  extern PrefPtr PREF_RPC_CERTIFICATE;
  // value: string that your file system recognizes as a file name.
 diff --git a/src/usage_text.h b/src/usage_text.h
-index 0871543..7dd5198 100644
+index 08715436..7dd51983 100644
 --- a/src/usage_text.h
 +++ b/src/usage_text.h
 @@ -841,6 +841,13 @@

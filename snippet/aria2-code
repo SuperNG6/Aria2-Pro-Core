@@ -9,14 +9,18 @@
 #
 
 ARIA2_GIT_CODE() {
+    # Pin to a specific upstream release tag so CI builds are reproducible
+    # and immune to unrelated master commits (security backports, work for
+    # the next minor, etc.). Bump this to a newer tag to upgrade aria2.
+    local ARIA2_TAG="release-1.37.0"
     if [[ -d $ARIA2_CODE_DIR && -d $ARIA2_CODE_DIR/.git ]]; then
         cd $ARIA2_CODE_DIR
-        git checkout master || git checkout HEAD
-        git reset --hard origin || git reset --hard
-        git pull
+        git fetch --tags --depth=1 origin "refs/tags/${ARIA2_TAG}:refs/tags/${ARIA2_TAG}"
+        git reset --hard "${ARIA2_TAG}"
     else
         rm -rf $ARIA2_CODE_DIR
-        git clone https://github.com/aria2/aria2 $ARIA2_CODE_DIR --depth=1
+        git clone https://github.com/aria2/aria2 $ARIA2_CODE_DIR \
+            --depth=1 --branch "${ARIA2_TAG}"
         cd $ARIA2_CODE_DIR
     fi
 }

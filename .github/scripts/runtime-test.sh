@@ -326,6 +326,36 @@ t_option_wiring() {
     fi
 }
 
+t_remove_wrong_type_param() {
+    hdr "12. removeFiles 参数类型不匹配应被静默忽略（向后兼容）"
+    # 上游对未识别的 trailing 参数静默忽略；我们必须保留这个行为，否则
+    # 客户端给 remove 多塞非 Bool 的字段会从"无害"变成"任务删不掉"。
+    if [[ -z "$CONTAINER" ]]; then echo "  ⚠ 跳过：未提供容器名"; return; fi
+    local fname="rmfiles-wrongtype-$$-$RANDOM.txt"
+    local url='https://raw.githubusercontent.com/aria2/aria2/master/README.rst'
+    local gid
+    gid=$(rpc aria2.addUri "[[\"$url\"],{\"out\":\"$fname\"}]" | jq -r '.result // ""')
+    [[ -z "$gid" ]] && { ng "addUri 返空"; return; }
+    local s
+    s=$(wait_final "$gid" 60)
+    [[ "$s" != "complete" ]] && { ng "下载未完成: $s"; return; }
+    # 用字符串 "true" 而不是 JSON true，再用对象 {} —— 这两种以前都是"被忽略"。
+    local resp
+    resp=$(rpc aria2.removeDownloadResult "[\"$gid\",\"true\"]" 2>/dev/null || true)
+    if echo "$resp" | jq -e '.result=="OK"' >/dev/null 2>&1; then
+        ok "字符串 \"true\" 被忽略，调用成功"
+    else
+        ng "字符串作 removeFiles 触发错误（破坏向后兼容）: $resp"
+    fi
+    # 数据文件应保留（因为参数被忽略 → 走默认 false 路径）
+    if file_exists_in_container "/downloads/$fname"; then
+        ok "文件保留（参数被忽略，未触发删除）"
+        docker exec "$CONTAINER" rm -f "/downloads/$fname" || true
+    else
+        ng "文件被意外删除（参数应当被忽略）"
+    fi
+}
+
 # ─────────────────── main ───────────────────
 
 echo "RPC: $RPC_URL  expected-version: ${EXPECTED_VER:-<none>}"
@@ -345,6 +375,7 @@ t_remove_files_backward_compat
 t_remove_files_paused
 t_remove_files_active
 t_option_wiring
+t_remove_wrong_type_param
 
 echo
 echo "═════════════════════════════════"
