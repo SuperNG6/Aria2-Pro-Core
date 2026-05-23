@@ -1,0 +1,276 @@
+From b09c27a89514d8f10d06ae25dbdd4409442613f3 Mon Sep 17 00:00:00 2001
+From: Aria2-Pro-Core <builder@local>
+Date: Sat, 23 May 2026 12:45:27 +0800
+Subject: [PATCH] rpc: add removeFiles flag to
+ remove/forceRemove/removeDownloadResult
+
+Adds an optional boolean parameter to aria2.remove, aria2.forceRemove,
+and aria2.removeDownloadResult. When true, the downloaded files (data
+and per-task control file) are deleted along with the task/result.
+Omitted or false keeps upstream behavior, so existing clients are
+unaffected.
+
+For active groups the flag is recorded in RequestGroupMan and consumed
+in ProcessStoppedRequestGroup after the I/O loop releases the file
+handles; for reserved (paused/queued) groups the deletion is
+synchronous; for already-stopped results it is handled directly in
+removeDownloadResult. The control file is removed via the group's
+BtProgressInfoFile, which uses the correct BT (<basePath>/<name>.aria2)
+or HTTP (<file>.aria2) path.
+---
+ src/RequestGroupMan.cc | 111 ++++++++++++++++++++++++++++++++++++++++-
+ src/RequestGroupMan.h  |  29 +++++++++--
+ src/RpcMethodImpl.cc   |  17 ++++++-
+ 3 files changed, 152 insertions(+), 5 deletions(-)
+
+diff --git a/src/RequestGroupMan.cc b/src/RequestGroupMan.cc
+index 425351b..0c7a54d 100644
+--- a/src/RequestGroupMan.cc
++++ b/src/RequestGroupMan.cc
+@@ -237,6 +237,72 @@ bool RequestGroupMan::removeReservedGroup(a2_gid_t gid)
+   return reservedGroups_.remove(gid);
+ }
+ 
++void RequestGroupMan::markRemoveFiles(a2_gid_t gid)
++{
++  removeFileGids_.insert(gid);
++}
++
++bool RequestGroupMan::takeRemoveFilesMark(a2_gid_t gid)
++{
++  return removeFileGids_.erase(gid) > 0;
++}
++
++void RequestGroupMan::removeFilesForGroup(
++    const std::shared_ptr<RequestGroup>& group)
++{
++  if (!group) {
++    return;
++  }
++  // Magnet metadata downloads have no on-disk file paths; skip.
++  if (group->inMemoryDownload()) {
++    return;
++  }
++  const auto& dctx = group->getDownloadContext();
++  if (!dctx) {
++    return;
++  }
++  // Control file first: this routes through BtProgressInfoFile so the BT
++  // case (<basePath>/<name>.aria2) and the HTTP case (<file>.aria2) are
++  // both handled correctly. Errors are non-fatal — the file may already
++  // be gone for completed downloads.
++  try {
++    group->removeControlFile();
++  }
++  catch (RecoverableException&) {
++    // ignore
++  }
++  for (const auto& entry : dctx->getFileEntries()) {
++    if (!entry) {
++      continue;
++    }
++    const std::string& path = entry->getPath();
++    if (path.empty()) {
++      continue;
++    }
++    File f(path);
++    if (f.exists()) {
++      if (f.remove()) {
++        A2_LOG_INFO(fmt(MSG_FILE_REMOVED, path.c_str()));
++      }
++      else {
++        A2_LOG_INFO(fmt(MSG_FILE_COULD_NOT_REMOVED, path.c_str()));
++      }
++    }
++  }
++  // Best-effort: also try to clear the BT top-level directory. File::remove()
++  // only succeeds when the directory is empty, so this is safe for the
++  // single-file HTTP case (basePath equals the file path, already removed)
++  // and only acts on multi-file torrents where every selected file has just
++  // been deleted above.
++  const std::string& basePath = dctx->getBasePath();
++  if (!basePath.empty()) {
++    File base(basePath);
++    if (base.exists() && base.isDir()) {
++      base.remove();
++    }
++  }
++}
++
+ namespace {
+ 
+ void notifyDownloadEvent(DownloadEvent event,
+@@ -455,7 +521,19 @@ public:
+       }
+       else {
+         std::shared_ptr<DownloadResult> dr = group->createDownloadResult();
++        bool removeFilesRequested =
++            e_->getRequestGroupMan()->takeRemoveFilesMark(group->getGID());
++        if (removeFilesRequested) {
++          e_->getRequestGroupMan()->removeFilesForGroup(group);
++        }
+         e_->getRequestGroupMan()->addDownloadResult(dr);
++        if (removeFilesRequested) {
++          // Discard the history entry too: the user asked for the task and
++          // its files to disappear entirely. addDownloadResult above already
++          // bumped numStoppedTotal_ and triggered eviction, which is correct.
++          e_->getRequestGroupMan()->removeDownloadResult(
++              dr->gid->getNumericId(), false);
++        }
+         executeStopHook(group, e_->getOption(), dr->result);
+         group->releaseRuntimeResource(e_);
+       }
+@@ -909,8 +987,39 @@ RequestGroupMan::findDownloadResult(a2_gid_t gid) const
+   return downloadResults_.get(gid);
+ }
+ 
+-bool RequestGroupMan::removeDownloadResult(a2_gid_t gid)
++bool RequestGroupMan::removeDownloadResult(a2_gid_t gid, bool removeFiles)
+ {
++  if (removeFiles) {
++    auto dr = downloadResults_.get(gid);
++    if (dr) {
++      // The control file has typically already been removed for completed
++      // downloads; for errored/aborted results that still have a .aria2 we
++      // try a per-entry suffix path (correct for HTTP single-file) on a
++      // best-effort basis.
++      for (const auto& entry : dr->fileEntries) {
++        if (!entry) {
++          continue;
++        }
++        const std::string& path = entry->getPath();
++        if (path.empty()) {
++          continue;
++        }
++        File f(path);
++        if (f.exists()) {
++          if (f.remove()) {
++            A2_LOG_INFO(fmt(MSG_FILE_REMOVED, path.c_str()));
++          }
++          else {
++            A2_LOG_INFO(fmt(MSG_FILE_COULD_NOT_REMOVED, path.c_str()));
++          }
++        }
++        File ctrl(path + ".aria2");
++        if (ctrl.exists()) {
++          ctrl.remove();
++        }
++      }
++    }
++  }
+   return downloadResults_.remove(gid);
+ }
+ 
+diff --git a/src/RequestGroupMan.h b/src/RequestGroupMan.h
+index b8aa8d4..924c73d 100644
+--- a/src/RequestGroupMan.h
++++ b/src/RequestGroupMan.h
+@@ -42,6 +42,7 @@
+ #include <vector>
+ #include <map>
+ #include <memory>
++#include <unordered_set>
+ 
+ #include "DownloadResult.h"
+ #include "TransferStat.h"
+@@ -130,6 +131,11 @@ private:
+   // SHA1 hash value of the content of last session serialization.
+   std::string lastSessionHash_;
+ 
++  // GIDs whose downloaded files should be removed when the active group
++  // transitions to stopped. Populated by markRemoveFiles() from the RPC
++  // handler and drained by takeRemoveFilesMark() in ProcessStoppedRequestGroup.
++  std::unordered_set<a2_gid_t> removeFileGids_;
++
+   void formatDownloadResultFull(
+       OutputFile& out, const char* status,
+       const std::shared_ptr<DownloadResult>& downloadResult) const;
+@@ -207,6 +213,21 @@ public:
+ 
+   bool removeReservedGroup(a2_gid_t gid);
+ 
++  // Marks gid so that, when the matching active group later transitions to
++  // stopped via ProcessStoppedRequestGroup, its downloaded files (data and
++  // control) are deleted instead of being kept on disk.
++  void markRemoveFiles(a2_gid_t gid);
++
++  // Returns true if gid was marked for file removal and clears the mark.
++  bool takeRemoveFilesMark(a2_gid_t gid);
++
++  // Deletes data files of every FileEntry in the group, the control file
++  // (.aria2) via the group's BtProgressInfoFile (which uses the correct
++  // BT-vs-HTTP path), and best-effort removes the now-empty base directory.
++  // Intended for active/reserved groups; for stopped results use
++  // removeDownloadResult(gid, true) instead.
++  void removeFilesForGroup(const std::shared_ptr<RequestGroup>& group);
++
+   bool getOptimizeConcurrentDownloads() const
+   {
+     return optimizeConcurrentDownloads_;
+@@ -259,9 +280,11 @@ public:
+   // Removes all download results.
+   void purgeDownloadResult();
+ 
+-  // Removes download result of given gid. Returns true if download
+-  // result was removed. Otherwise returns false.
+-  bool removeDownloadResult(a2_gid_t gid);
++  // Removes download result of given gid. When removeFiles is true, also
++  // deletes the data files recorded in the result (and per-entry .aria2
++  // control files where they still exist). Returns true if download result
++  // was removed. Otherwise returns false.
++  bool removeDownloadResult(a2_gid_t gid, bool removeFiles = false);
+ 
+   void addDownloadResult(const std::shared_ptr<DownloadResult>& downloadResult);
+ 
+diff --git a/src/RpcMethodImpl.cc b/src/RpcMethodImpl.cc
+index c224920..bd2af3c 100644
+--- a/src/RpcMethodImpl.cc
++++ b/src/RpcMethodImpl.cc
+@@ -390,11 +390,19 @@ std::unique_ptr<ValueBase> removeDownload(const RpcRequest& req,
+                                           DownloadEngine* e, bool forceRemove)
+ {
+   const String* gidParam = checkRequiredParam<String>(req, 0);
++  const Bool* removeFilesParam = checkParam<Bool>(req, 1);
++  bool removeFiles = removeFilesParam && removeFilesParam->val();
+ 
+   a2_gid_t gid = str2Gid(gidParam);
+   auto group = e->getRequestGroupMan()->findGroup(gid);
+   if (group) {
+     if (group->getState() == RequestGroup::STATE_ACTIVE) {
++      if (removeFiles) {
++        // Defer to ProcessStoppedRequestGroup: the running download holds
++        // open file handles, so synchronous unlink would race with the I/O
++        // loop. The mark is consumed when the group transitions to stopped.
++        e->getRequestGroupMan()->markRemoveFiles(gid);
++      }
+       if (forceRemove) {
+         group->setForceHaltRequested(true, RequestGroup::USER_REQUEST);
+       }
+@@ -405,6 +413,11 @@ std::unique_ptr<ValueBase> removeDownload(const RpcRequest& req,
+     }
+     else {
+       if (group->isDependencyResolved()) {
++        if (removeFiles) {
++          // Paused/queued group: no active I/O, safe to delete synchronously
++          // before dropping the reservation.
++          e->getRequestGroupMan()->removeFilesForGroup(group);
++        }
+         e->getRequestGroupMan()->removeReservedGroup(gid);
+       }
+       else {
+@@ -1097,9 +1110,11 @@ std::unique_ptr<ValueBase>
+ RemoveDownloadResultRpcMethod::process(const RpcRequest& req, DownloadEngine* e)
+ {
+   const String* gidParam = checkRequiredParam<String>(req, 0);
++  const Bool* removeFilesParam = checkParam<Bool>(req, 1);
++  bool removeFiles = removeFilesParam && removeFilesParam->val();
+ 
+   a2_gid_t gid = str2Gid(gidParam);
+-  if (!e->getRequestGroupMan()->removeDownloadResult(gid)) {
++  if (!e->getRequestGroupMan()->removeDownloadResult(gid, removeFiles)) {
+     throw DL_ABORT_EX(fmt("Could not remove download result of GID#%s",
+                           GroupId::toHex(gid).c_str()));
+   }
+-- 
+2.50.1 (Apple Git-155)
+

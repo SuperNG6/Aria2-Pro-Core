@@ -173,7 +173,7 @@ jobs:
           exit 1
         fi
 
-        if ! .github/scripts/runtime-test.sh 127.0.0.1 "${RPC_PORT}" "${SECRET}" "${ARIA2_VERSION}"; then
+        if ! .github/scripts/runtime-test.sh 127.0.0.1 "${RPC_PORT}" "${SECRET}" "${ARIA2_VERSION}" "${CONTAINER}"; then
           echo "::error::Runtime test failed"
           echo "=== docker logs (tail 100) ==="
           docker logs --tail 100 "${CONTAINER}" || true

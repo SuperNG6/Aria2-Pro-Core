@@ -4,7 +4,7 @@
 # /usr/local/bin/aria2c. Verifies the binary boots under s6-overlay,
 # answers RPC, runs a real download, and accepts state transitions.
 #
-# Usage: runtime-test.sh <host> <port> <secret> <expected-version>
+# Usage: runtime-test.sh <host> <port> <secret> <expected-version> [container]
 
 set -uo pipefail
 
@@ -12,6 +12,7 @@ HOST="${1:-127.0.0.1}"
 PORT="${2:-6800}"
 SECRET="${3:-smoketoken}"
 EXPECTED_VER="${4:-}"
+CONTAINER="${5:-}"
 RPC_URL="http://${HOST}:${PORT}/jsonrpc"
 TOKEN="token:${SECRET}"
 
@@ -147,6 +148,161 @@ t_query_lists() {
         && ok "tellStopped 数组" || ng "tellStopped 非数组"
 }
 
+# ─── removeFiles RPC 扩展（patch 0006）──────────────────────────────
+
+# 在容器内检查文件是否存在；返回 0 = 存在，1 = 不存在
+file_exists_in_container() {
+    local path="$1"
+    docker exec "$CONTAINER" test -e "$path"
+}
+
+# 轮询等待容器内文件被删除；超时返回 1
+wait_file_gone() {
+    local path="$1" timeout="${2:-15}" elapsed=0
+    while ((elapsed < timeout)); do
+        if ! file_exists_in_container "$path"; then
+            return 0
+        fi
+        sleep 1
+        elapsed=$((elapsed + 1))
+    done
+    return 1
+}
+
+t_remove_files_completed_result() {
+    hdr "7. removeDownloadResult removeFiles=true（已完成任务）"
+    if [[ -z "$CONTAINER" ]]; then echo "  ⚠ 跳过：未提供容器名"; return; fi
+    local fname="rmfiles-completed-$$-$RANDOM.txt"
+    local url='https://raw.githubusercontent.com/aria2/aria2/master/README.rst'
+    local gid
+    gid=$(rpc aria2.addUri "[[\"$url\"],{\"out\":\"$fname\"}]" | jq -r '.result // ""')
+    [[ -z "$gid" ]] && { ng "addUri 返空"; return; }
+    local s
+    s=$(wait_final "$gid" 60)
+    [[ "$s" != "complete" ]] && { ng "下载未完成: $s"; return; }
+    file_exists_in_container "/downloads/$fname" \
+        || { ng "下载完成后文件本应存在"; return; }
+    ok "下载完成且文件存在"
+    rpc aria2.removeDownloadResult "[\"$gid\",true]" | jq -e '.result=="OK"' >/dev/null \
+        || { ng "removeDownloadResult 调用失败"; return; }
+    if wait_file_gone "/downloads/$fname" 10; then
+        ok "removeFiles=true → 文件已删除"
+    else
+        ng "removeFiles=true 后文件仍存在"
+        docker exec "$CONTAINER" ls -la "/downloads/$fname" 2>&1 | head -3 || true
+    fi
+}
+
+t_remove_files_backward_compat() {
+    hdr "8. removeDownloadResult 不带标志（向后兼容回归）"
+    if [[ -z "$CONTAINER" ]]; then echo "  ⚠ 跳过：未提供容器名"; return; fi
+    local fname="rmfiles-compat-$$-$RANDOM.txt"
+    local url='https://raw.githubusercontent.com/aria2/aria2/master/README.rst'
+    local gid
+    gid=$(rpc aria2.addUri "[[\"$url\"],{\"out\":\"$fname\"}]" | jq -r '.result // ""')
+    [[ -z "$gid" ]] && { ng "addUri 返空"; return; }
+    local s
+    s=$(wait_final "$gid" 60)
+    [[ "$s" != "complete" ]] && { ng "下载未完成: $s"; return; }
+    rpc aria2.removeDownloadResult "[\"$gid\"]" | jq -e '.result=="OK"' >/dev/null \
+        || { ng "removeDownloadResult 调用失败"; return; }
+    sleep 1
+    if file_exists_in_container "/downloads/$fname"; then
+        ok "未传 removeFiles → 文件保留（与上游一致）"
+    else
+        ng "未传 removeFiles 时文件意外被删（破坏向后兼容）"
+    fi
+    docker exec "$CONTAINER" rm -f "/downloads/$fname" || true
+}
+
+t_remove_files_paused() {
+    hdr "9. remove removeFiles=true（暂停的任务）"
+    if [[ -z "$CONTAINER" ]]; then echo "  ⚠ 跳过：未提供容器名"; return; fi
+    local fname="rmfiles-paused-$$-$RANDOM.bin"
+    # 2MB + 限速 50K → 文件被 falloc 立即创建，pause 时 .aria2 控制文件也存在
+    rpc aria2.changeGlobalOption '[{"max-overall-download-limit":"50K"}]' >/dev/null
+    local url='https://speed.cloudflare.com/__down?bytes=2097152'
+    local gid
+    gid=$(rpc aria2.addUri "[[\"$url\"],{\"out\":\"$fname\"}]" | jq -r '.result // ""')
+    [[ -z "$gid" ]] && {
+        ng "addUri 返空"
+        rpc aria2.changeGlobalOption '[{"max-overall-download-limit":"0"}]' >/dev/null
+        return
+    }
+    sleep 3
+    rpc aria2.pause "[\"$gid\"]" >/dev/null
+    local s
+    s=$(wait_status "$gid" paused 10) || true
+    [[ "$s" != "paused" ]] && {
+        ng "pause 失败: $s"
+        rpc aria2.changeGlobalOption '[{"max-overall-download-limit":"0"}]' >/dev/null
+        return
+    }
+    file_exists_in_container "/downloads/$fname" || {
+        ng "暂停后数据文件本应存在"
+        rpc aria2.changeGlobalOption '[{"max-overall-download-limit":"0"}]' >/dev/null
+        return
+    }
+    ok "暂停状态确认，数据文件存在"
+    rpc aria2.remove "[\"$gid\",true]" | jq -e '.result' >/dev/null \
+        || { ng "remove 调用失败"; }
+    # paused → reserved 路径是同步删除，应立即生效
+    if wait_file_gone "/downloads/$fname" 5; then
+        ok "removeFiles=true → 数据文件已删除"
+    else
+        ng "数据文件仍存在"
+        docker exec "$CONTAINER" ls -la "/downloads/$fname"* 2>&1 | head -3 || true
+    fi
+    if file_exists_in_container "/downloads/$fname.aria2"; then
+        ng "控制文件 .aria2 未被删除"
+    else
+        ok "控制文件 .aria2 一并删除"
+    fi
+    rpc aria2.removeDownloadResult "[\"$gid\"]" >/dev/null 2>&1 || true
+    rpc aria2.changeGlobalOption '[{"max-overall-download-limit":"0"}]' >/dev/null
+}
+
+t_remove_files_active() {
+    hdr "10. remove removeFiles=true（活动中的任务）"
+    if [[ -z "$CONTAINER" ]]; then echo "  ⚠ 跳过：未提供容器名"; return; fi
+    local fname="rmfiles-active-$$-$RANDOM.bin"
+    rpc aria2.changeGlobalOption '[{"max-overall-download-limit":"50K"}]' >/dev/null
+    local url='https://speed.cloudflare.com/__down?bytes=2097152'
+    local gid
+    gid=$(rpc aria2.addUri "[[\"$url\"],{\"out\":\"$fname\"}]" | jq -r '.result // ""')
+    [[ -z "$gid" ]] && {
+        ng "addUri 返空"
+        rpc aria2.changeGlobalOption '[{"max-overall-download-limit":"0"}]' >/dev/null
+        return
+    }
+    # 让 aria2 进入 active 并分配文件
+    local s
+    s=$(wait_status "$gid" active 10) || true
+    if [[ "$s" != "active" ]]; then
+        ng "未进入 active: $s"
+        rpc aria2.changeGlobalOption '[{"max-overall-download-limit":"0"}]' >/dev/null
+        return
+    fi
+    sleep 1
+    file_exists_in_container "/downloads/$fname" || {
+        ng "active 后数据文件本应存在"
+        rpc aria2.changeGlobalOption '[{"max-overall-download-limit":"0"}]' >/dev/null
+        return
+    }
+    ok "active 状态确认，数据文件存在"
+    rpc aria2.remove "[\"$gid\",true]" | jq -e '.result' >/dev/null \
+        || ng "remove 调用失败"
+    # active → 经 ProcessStoppedRequestGroup 异步删除，给充足时间
+    if wait_file_gone "/downloads/$fname" 15; then
+        ok "removeFiles=true → 数据文件已删除（异步）"
+    else
+        ng "数据文件仍存在"
+        docker exec "$CONTAINER" ls -la "/downloads/$fname"* 2>&1 | head -3 || true
+    fi
+    rpc aria2.removeDownloadResult "[\"$gid\"]" >/dev/null 2>&1 || true
+    rpc aria2.changeGlobalOption '[{"max-overall-download-limit":"0"}]' >/dev/null
+}
+
 # ─────────────────── main ───────────────────
 
 echo "RPC: $RPC_URL  expected-version: ${EXPECTED_VER:-<none>}"
@@ -161,6 +317,10 @@ t_change_global_option
 t_http_download
 t_pause_unpause
 t_query_lists
+t_remove_files_completed_result
+t_remove_files_backward_compat
+t_remove_files_paused
+t_remove_files_active
 
 echo
 echo "═════════════════════════════════"
