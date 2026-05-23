@@ -124,6 +124,65 @@ jobs:
         fi
         echo "ARIA2_VERSION=${CLI_VER}" >> $GITHUB_ENV
 
+    - name: Container Runtime Testing
+      if: matrix.PLATFORMS == 'amd64'
+      env:
+        IMAGE: superng6/aria2:dev-latest
+        CONTAINER: aria2-runtime-test
+        RPC_PORT: 16800
+        WEB_PORT: 18080
+        SECRET: ci-runtime-token
+      run: |
+        chmod +x ./output/aria2c
+        chmod +x .github/scripts/runtime-test.sh
+
+        docker pull "${IMAGE}"
+
+        docker run -d \
+          --name "${CONTAINER}" \
+          -p "${RPC_PORT}:6800" \
+          -p "${WEB_PORT}:8080" \
+          -e SECRET="${SECRET}" \
+          -e UT=false \
+          -e RUT=false \
+          -e PORT=6800 \
+          -e WEBUI_PORT=8080 \
+          -v "$PWD/output/aria2c:/usr/local/bin/aria2c:ro" \
+          "${IMAGE}"
+
+        echo "Observe container logs for 15s while it boots..."
+        timeout 15s docker logs -f "${CONTAINER}" || true
+
+        for i in {1..15}; do
+          if curl -fsS "http://127.0.0.1:${RPC_PORT}/jsonrpc" \
+              -H 'Content-Type: application/json' \
+              -d "{\"jsonrpc\":\"2.0\",\"method\":\"aria2.getVersion\",\"id\":\"p\",\"params\":[\"token:${SECRET}\"]}" \
+              | jq -e '.result.version' >/dev/null 2>&1; then
+            echo "RPC up"
+            break
+          fi
+          sleep 2
+        done
+
+        IN_CONTAINER_VER=$(docker exec "${CONTAINER}" aria2c --version | head -1 | awk '{print $3}')
+        echo "aria2c version inside container: ${IN_CONTAINER_VER}"
+        if [ "${IN_CONTAINER_VER}" != "${ARIA2_VERSION}" ]; then
+          echo "::error::Mounted aria2c reports ${IN_CONTAINER_VER}, expected ${ARIA2_VERSION}"
+          docker logs "${CONTAINER}" | tail -50
+          docker rm -f "${CONTAINER}" || true
+          exit 1
+        fi
+
+        if ! .github/scripts/runtime-test.sh 127.0.0.1 "${RPC_PORT}" "${SECRET}" "${ARIA2_VERSION}"; then
+          echo "::error::Runtime test failed"
+          echo "=== docker logs (tail 100) ==="
+          docker logs --tail 100 "${CONTAINER}" || true
+          docker rm -f "${CONTAINER}" || true
+          exit 1
+        fi
+
+        docker rm -f "${CONTAINER}" || true
+
     - name: Generate release informations
       run: |
         TIME="$(curl https://api.github.com/repos/${SCRIPT_REPO}/actions/runs/${GITHUB_RUN_ID} | jq -r .created_at)"
